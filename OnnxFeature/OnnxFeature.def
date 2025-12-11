@@ -1,0 +1,11 @@
+﻿LIBRARY OnnxFeature
+EXPORTS
+    OnnxCreateSession
+    OnnxCreateOcrSession
+    OnnxDetectImage
+    OnnxDetectWindow
+    OnnxOcrImage
+    OnnxOcrWindow
+    PaddleOcrFindText
+    PaddleOcrFindTextInImage
+    OnnxPlugin_Cleanup

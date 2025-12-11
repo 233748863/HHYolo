@@ -1,0 +1,13 @@
+﻿LIBRARY    "HHYolo"
+EXPORTS
+    FindImage
+    FindImageFromMem
+    CaptureAndFindImage
+    CaptureAndFindAllImages
+    ReadMemory
+    CaptureAndFindMultiTemplates
+    FindColor
+    AnalyzeGrid
+    Ocr
+    OcrFile
+    HH_FindText
