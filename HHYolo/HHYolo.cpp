@@ -888,15 +888,6 @@ typedef NTSTATUS (NTAPI *pfnNtWow64QueryInformationProcess64)(
     PULONG ReturnLength
 );
 
-// 64位进程的PEB结构（简化版，只包含需要的字段）
-typedef struct _PEB64 {
-    BYTE Reserved1[2];
-    BYTE BeingDebugged;
-    BYTE Reserved2[21];
-    ULONGLONG Ldr;  // 偏移 0x18: PEB_LDR_DATA64 指针
-    // ... 其他字段省略
-} PEB64;
-
 // 64位进程的 PROCESS_BASIC_INFORMATION
 typedef struct _PROCESS_BASIC_INFORMATION64 {
     ULONGLONG Reserved1;
@@ -916,8 +907,15 @@ typedef struct _PEB_LDR_DATA64 {
     LIST_ENTRY64 InInitializationOrderModuleList;
 } PEB_LDR_DATA64;
 
+// 64位 UNICODE_STRING 结构
+typedef struct _UNICODE_STRING64_CUSTOM {
+    USHORT Length;
+    USHORT MaximumLength;
+    ULONGLONG Buffer;
+} UNICODE_STRING64_CUSTOM;
+
 // 64位 LDR_DATA_TABLE_ENTRY 结构
-typedef struct _LDR_DATA_TABLE_ENTRY64 {
+typedef struct _LDR_DATA_TABLE_ENTRY64_CUSTOM {
     LIST_ENTRY64 InLoadOrderLinks;
     LIST_ENTRY64 InMemoryOrderLinks;
     LIST_ENTRY64 InInitializationOrderLinks;
@@ -925,28 +923,9 @@ typedef struct _LDR_DATA_TABLE_ENTRY64 {
     ULONGLONG EntryPoint;
     ULONG SizeOfImage;
     ULONG Reserved;
-    UNICODE_STRING64 FullDllName;
-    UNICODE_STRING64 BaseDllName;
-} LDR_DATA_TABLE_ENTRY64;
-
-// 定义 UNICODE_STRING64（如果未定义）
-#ifndef _UNICODE_STRING64_DEFINED
-#define _UNICODE_STRING64_DEFINED
-typedef struct _UNICODE_STRING64 {
-    USHORT Length;
-    USHORT MaximumLength;
-    ULONGLONG Buffer;
-} UNICODE_STRING64;
-#endif
-
-// 定义 LIST_ENTRY64（如果未定义）
-#ifndef _LIST_ENTRY64_DEFINED
-#define _LIST_ENTRY64_DEFINED
-typedef struct _LIST_ENTRY64 {
-    ULONGLONG Flink;
-    ULONGLONG Blink;
-} LIST_ENTRY64;
-#endif
+    UNICODE_STRING64_CUSTOM FullDllName;
+    UNICODE_STRING64_CUSTOM BaseDllName;
+} LDR_DATA_TABLE_ENTRY64_CUSTOM;
 
 // 全局函数指针，延迟加载
 static pfnNtWow64ReadVirtualMemory64 g_NtWow64ReadVirtualMemory64 = nullptr;
@@ -1062,7 +1041,7 @@ static ULONGLONG GetModuleBaseAddress64Bit(HANDLE hProcess, const char* moduleNa
     int maxIterations = 1000; // 防止无限循环
     while (currentEntry != listHead && maxIterations-- > 0) {
         // 读取 LDR_DATA_TABLE_ENTRY64
-        LDR_DATA_TABLE_ENTRY64 entry = {0};
+        LDR_DATA_TABLE_ENTRY64_CUSTOM entry = {0};
         status = g_NtWow64ReadVirtualMemory64(
             hProcess,
             currentEntry,
@@ -1078,7 +1057,7 @@ static ULONGLONG GetModuleBaseAddress64Bit(HANDLE hProcess, const char* moduleNa
         // 读取模块名
         if (entry.BaseDllName.Length > 0 && entry.BaseDllName.Buffer != 0) {
             wchar_t dllName[256] = {0};
-            USHORT nameLen = min(entry.BaseDllName.Length, (USHORT)(sizeof(dllName) - 2));
+            USHORT nameLen = (std::min)((USHORT)(sizeof(dllName) - 2), entry.BaseDllName.Length);
             
             status = g_NtWow64ReadVirtualMemory64(
                 hProcess,
