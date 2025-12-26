@@ -74,13 +74,27 @@ target_compile_definitions(HHYolo PRIVATE
 # - ONNX Runtime: 动态链接（需要外部onnxruntime.dll）
 
 # 手动查找动态版本的ONNX Runtime库
+# 优先使用环境变量，其次使用vcpkg默认路径
+if(DEFINED ENV{ONNXRUNTIME_ROOT})
+    set(ONNXRUNTIME_SEARCH_PATHS "$ENV{ONNXRUNTIME_ROOT}/include" "$ENV{ONNXRUNTIME_ROOT}/lib")
+else()
+    set(ONNXRUNTIME_SEARCH_PATHS 
+        "${VCPKG_INSTALLED_DIR}/x86-windows/include"
+        "C:/vcpkg/installed/x86-windows/include"
+    )
+    set(ONNXRUNTIME_LIB_PATHS
+        "${VCPKG_INSTALLED_DIR}/x86-windows/lib"
+        "C:/vcpkg/installed/x86-windows/lib"
+    )
+endif()
+
 find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
-    PATHS "C:/vcpkg/installed/x86-windows/include"
+    PATHS ${ONNXRUNTIME_SEARCH_PATHS}
     REQUIRED
 )
 
 find_library(ONNXRUNTIME_LIB onnxruntime.lib
-    PATHS "C:/vcpkg/installed/x86-windows/lib"
+    PATHS ${ONNXRUNTIME_LIB_PATHS}
     REQUIRED
 )
 
@@ -115,10 +129,19 @@ target_compile_definitions(OnnxFeature PRIVATE
 # 依赖关系 - OnnxFeature依赖于HHYolo的构建
 add_dependencies(OnnxFeature HHYolo)
 
+# 查找 onnxruntime.dll 路径
+if(DEFINED ENV{ONNXRUNTIME_ROOT})
+    set(ONNXRUNTIME_DLL_PATH "$ENV{ONNXRUNTIME_ROOT}/bin/onnxruntime.dll")
+elseif(EXISTS "${VCPKG_INSTALLED_DIR}/x86-windows/bin/onnxruntime.dll")
+    set(ONNXRUNTIME_DLL_PATH "${VCPKG_INSTALLED_DIR}/x86-windows/bin/onnxruntime.dll")
+else()
+    set(ONNXRUNTIME_DLL_PATH "C:/vcpkg/installed/x86-windows/bin/onnxruntime.dll")
+endif()
+
 # 复制 onnxruntime.dll 到输出目录
 # OnnxFeature.dll需要外部onnxruntime.dll才能正常运行
 add_custom_command(TARGET OnnxFeature POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "C:/vcpkg/installed/x86-windows/bin/onnxruntime.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${ONNXRUNTIME_DLL_PATH}"
         $<TARGET_FILE_DIR:OnnxFeature>
 )

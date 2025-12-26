@@ -1163,16 +1163,18 @@ __declspec(dllexport) int OnnxDetectImageAsync(
         if (detections.empty()) return "0";
         
         std::stringstream result;
+        bool firstMatch = true;
         for (size_t i = 0; i < detections.size(); i++) {
             const auto& det = detections[i];
             if (det.confidence >= confidenceThreshold) {
-                if (i > 0) result << "|";
+                if (!firstMatch) result << "|";
                 result << det.className << "," 
                       << det.confidence << "," 
                       << det.x << "," 
                       << det.y << "," 
                       << det.width << "," 
                       << det.height;
+                firstMatch = false;
             }
         }
         
@@ -1208,16 +1210,18 @@ __declspec(dllexport) int OnnxDetectWindowAsync(
         if (detections.empty()) return "0";
         
         std::stringstream result;
+        bool firstMatch = true;
         for (size_t i = 0; i < detections.size(); i++) {
             const auto& det = detections[i];
             if (det.confidence >= confidenceThreshold) {
-                if (i > 0) result << "|";
+                if (!firstMatch) result << "|";
                 result << det.className << "," 
                       << det.confidence << "," 
                       << (det.x + roiX) << "," 
                       << (det.y + roiY) << "," 
                       << det.width << "," 
                       << det.height;
+                firstMatch = false;
             }
         }
         
@@ -1309,13 +1313,16 @@ __declspec(dllexport) const char* OnnxGetAsyncResult(
     // 清理过期任务
     CleanupExpiredTasks();
     
-    AsyncTask* task = GetAsyncTask(taskId);
-    if (!task) {
+    std::lock_guard<std::mutex> lock(g_taskMutex);
+    auto it = g_asyncTasks.find(taskId);
+    if (it == g_asyncTasks.end()) {
         strcpy_s(g_resultBuffer, sizeof(g_resultBuffer), "-1");
         return g_resultBuffer;
     }
     
-    // 检查任务状态
+    AsyncTask* task = it->second.get();
+    
+    // 检查任务状态 - 如果已完成/失败，直接返回缓存的结果
     if (task->status == AsyncTaskStatus::COMPLETED || task->status == AsyncTaskStatus::FAILED) {
         strcpy_s(g_resultBuffer, sizeof(g_resultBuffer), task->result.c_str());
         return g_resultBuffer;
@@ -1326,24 +1333,20 @@ __declspec(dllexport) const char* OnnxGetAsyncResult(
         return g_resultBuffer;
     }
     
-    // 等待任务完成
+    // 立即返回模式
     if (timeoutMs == 0) {
-        // 立即返回
         strcpy_s(g_resultBuffer, sizeof(g_resultBuffer), "");
         return g_resultBuffer;
     }
     
+    // 等待任务完成 - 需要先释放锁再等待，避免死锁
+    // 但由于 future 已经在任务完成时设置了 result，我们可以直接检查 future 状态
     auto status = task->future.wait_for(std::chrono::milliseconds(timeoutMs));
     
     if (status == std::future_status::ready) {
-        try {
-            std::string result = task->future.get();
-            strcpy_s(g_resultBuffer, sizeof(g_resultBuffer), result.c_str());
-            return g_resultBuffer;
-        } catch (...) {
-            strcpy_s(g_resultBuffer, sizeof(g_resultBuffer), "-1");
-            return g_resultBuffer;
-        }
+        // 任务已完成，结果已经在 task->result 中
+        strcpy_s(g_resultBuffer, sizeof(g_resultBuffer), task->result.c_str());
+        return g_resultBuffer;
     } else if (status == std::future_status::timeout) {
         strcpy_s(g_resultBuffer, sizeof(g_resultBuffer), "timeout");
         return g_resultBuffer;
@@ -1513,16 +1516,18 @@ __declspec(dllexport) const char* OnnxDetectImage(
         
         // 格式化结果字符串
         std::stringstream result;
+        bool firstMatch = true;
         for (size_t i = 0; i < detections.size(); i++) {
             const auto& det = detections[i];
             if (det.confidence >= confidenceThreshold) {
-                if (i > 0) result << "|";
+                if (!firstMatch) result << "|";
                 result << det.className << "," 
                       << det.confidence << "," 
                       << det.x << "," 
                       << det.y << "," 
                       << det.width << "," 
                       << det.height;
+                firstMatch = false;
             }
         }
         
@@ -1867,16 +1872,18 @@ __declspec(dllexport) const char* OnnxDetectWindow(
         
         // 格式化结果字符串
         std::stringstream result;
+        bool firstMatch = true;
         for (size_t i = 0; i < detections.size(); i++) {
             const auto& det = detections[i];
             if (det.confidence >= confidenceThreshold) {
-                if (i > 0) result << "|";
+                if (!firstMatch) result << "|";
                 result << det.className << "," 
                       << det.confidence << "," 
                       << (det.x + roiX) << ","  // 坐标转换为相对于窗口的绝对坐标
                       << (det.y + roiY) << "," 
                       << det.width << "," 
                       << det.height;
+                firstMatch = false;
             }
         }
         

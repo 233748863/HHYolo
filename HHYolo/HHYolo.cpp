@@ -13,7 +13,13 @@
 #include <filesystem>
 #include <tesseract/baseapi.h>
 #include <windows.h> // MessageBoxA
+#include <winternl.h> // for NTSTATUS
 #include "../Common/Utils.h"
+
+// NTSTATUS 定义（如果 winternl.h 没有提供）
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+#endif
 
 
 
@@ -74,57 +80,60 @@ static std::vector<OcrWord> InternalOcr(
 
     // --- 1. 图像预处理 ---
     cv::Mat processedImage; // 用于存储最终送入Tesseract的图像
-    const float scale = 3.0f; // 图像放大倍数，提高对小字体文本的识别率
-    const int border = 10; // 添加到图像周围的白色边框大小，防止边缘字符被切割
+    const float scale = 2.0f; // 放大倍数，2倍对屏幕截图足够
+    const int border = Common::OCR_BORDER_SIZE; // 添加到图像周围的白色边框大小
 
     try {
         // --- 1.1. 转换为灰度图 ---
         cv::Mat grayMat;
         if (inputImage.channels() == 4) {
-            cv::cvtColor(inputImage, grayMat, cv::COLOR_BGRA2GRAY); // 4通道（带alpha）转灰度
+            cv::cvtColor(inputImage, grayMat, cv::COLOR_BGRA2GRAY);
         } else if (inputImage.channels() == 3) {
-            cv::cvtColor(inputImage, grayMat, cv::COLOR_BGR2GRAY); // 3通道（BGR）转灰度
+            cv::cvtColor(inputImage, grayMat, cv::COLOR_BGR2GRAY);
         } else {
-            grayMat = inputImage; // 如果已经是单通道，直接使用
+            grayMat = inputImage.clone();
         }
 
-        // --- 1.2. 图像缩放和增强 ---
-        // 使用三次样条插值放大图像，使文本更清晰
+        // --- 1.2. 图像缩放 ---
+        // 使用三次样条插值放大图像
         cv::resize(grayMat, grayMat, cv::Size(), scale, scale, cv::INTER_CUBIC);
-        // 应用对比度受限的自适应直方图均衡化（CLAHE）来增强图像对比度
-        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(1.5, cv::Size(8, 8));
-        clahe->apply(grayMat, grayMat);
-        // 轻微高斯模糊以去除噪声
-        cv::GaussianBlur(grayMat, grayMat, cv::Size(3, 3), 0.0);
 
-        // --- 1.3. 动态二值化 ---
-        cv::Mat bin;
+        // --- 1.3. 对比度增强（仅对低对比度图像） ---
         cv::Scalar m, s;
-        cv::meanStdDev(grayMat, m, s); // 计算图像的标准差，以判断对比度
-        if (s[0] < 30) { // 如果标准差低（对比度低）
-            // 使用高斯自适应阈值，对光照不均的图像效果更好
-            cv::adaptiveThreshold(grayMat, bin, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C, cv::THRESH_BINARY, 15, 5);
-        } else { // 如果对比度高
-            // 使用OTSU方法自动寻找全局最佳阈值
+        cv::meanStdDev(grayMat, m, s);
+        if (s[0] < Common::OCR_LOW_CONTRAST_THRESHOLD) {
+            // 低对比度图像才使用 CLAHE 增强
+            cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+            clahe->apply(grayMat, grayMat);
+        }
+
+        // --- 1.4. 动态二值化 ---
+        cv::Mat bin;
+        cv::meanStdDev(grayMat, m, s); // 重新计算（可能经过CLAHE处理）
+        if (s[0] < Common::OCR_LOW_CONTRAST_THRESHOLD) {
+            // 低对比度：使用自适应阈值
+            cv::adaptiveThreshold(grayMat, bin, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C, cv::THRESH_BINARY, 11, 2);
+        } else {
+            // 高对比度：使用 OTSU 全局阈值
             cv::threshold(grayMat, bin, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
         }
 
-        // --- 1.4. 颜色反转和形态学操作 ---
-        // Tesseract通常在白底黑字上表现更好，如果图像是黑底白字，则反转颜色
+        // --- 1.5. 确保白底黑字 ---
+        // Tesseract 在白底黑字上表现更好
         if (cv::mean(bin)[0] < 127) {
             cv::bitwise_not(bin, bin);
         }
-        // 开运算：先腐蚀后膨胀，用于移除小的噪声点
-        cv::morphologyEx(bin, bin, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2)));
-        // 膨胀：加粗字体笔画，有助于识别
-        cv::dilate(bin, bin, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(1, 1)));
+
+        // --- 1.6. 轻微去噪（二值化后） ---
+        // 使用小核开运算去除孤立噪点，不影响文字
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2));
+        cv::morphologyEx(bin, bin, cv::MORPH_OPEN, kernel);
         
-        // --- 1.5. 添加边框 ---
-        // 在图像周围添加白色边框，确保边缘的字符能被完整识别
+        // --- 1.7. 添加边框 ---
         cv::copyMakeBorder(bin, processedImage, border, border, border, border, cv::BORDER_CONSTANT, cv::Scalar(255));
     
     } catch (...) {
-        return results; // 如果预处理过程中发生任何异常，返回空结果
+        return results;
     }
 
     // --- 2. Tesseract OCR (使用 thread_local 缓存实例) ---
@@ -137,25 +146,27 @@ static std::vector<OcrWord> InternalOcr(
     }
 
     const char* langToUse = (lang && *lang) ? lang : "chi_sim";
+    const char* tessdataToUse = tessdataPath ? tessdataPath : "";
     
     // 检查是否需要重新初始化 (语言或数据路径改变)
-    if (currentLang != langToUse || currentTessdata != tessdataPath) {
+    if (currentLang != langToUse || currentTessdata != tessdataToUse) {
         api->End();
         
         bool initSuccess = false;
         // 优先使用用户提供的路径
-        if (api->Init(tessdataPath, langToUse, tesseract::OEM_LSTM_ONLY) == 0) {
+        if (tessdataPath && *tessdataPath && api->Init(tessdataPath, langToUse, tesseract::OEM_LSTM_ONLY) == 0) {
             initSuccess = true;
         } else {
             // 其次尝试 "path/tessdata"
-            std::string altPath = std::string(tessdataPath) + "/tessdata";
-            if (api->Init(altPath.c_str(), langToUse, tesseract::OEM_LSTM_ONLY) == 0) {
-                initSuccess = true;
-            } else {
-                // 最后尝试系统路径
-                if (api->Init(NULL, langToUse, tesseract::OEM_LSTM_ONLY) == 0) {
+            if (tessdataPath && *tessdataPath) {
+                std::string altPath = std::string(tessdataPath) + "/tessdata";
+                if (api->Init(altPath.c_str(), langToUse, tesseract::OEM_LSTM_ONLY) == 0) {
                     initSuccess = true;
                 }
+            }
+            // 最后尝试系统路径
+            if (!initSuccess && api->Init(NULL, langToUse, tesseract::OEM_LSTM_ONLY) == 0) {
+                initSuccess = true;
             }
         }
 
@@ -164,14 +175,13 @@ static std::vector<OcrWord> InternalOcr(
         }
 
         currentLang = langToUse;
-        currentTessdata = tessdataPath;
+        currentTessdata = tessdataToUse;
 
-        // --- 2.2. 设置Tesseract参数 (仅在初始化时设置) ---
+        // --- 2.2. 设置Tesseract参数 ---
         api->SetSourceResolution(300);
-        api->SetVariable("user_defined_dpi", "300");
-        api->SetPageSegMode(tesseract::PSM_SINGLE_LINE);
+        // PSM_SINGLE_BLOCK (6): 假设图像是单个统一的文本块
+        api->SetPageSegMode(tesseract::PSM_SINGLE_BLOCK);
         api->SetVariable("preserve_interword_spaces", "1");
-        api->SetVariable("tessedit_pageseg_mode", "6");
     }
 
     try {
@@ -860,6 +870,280 @@ const char* __stdcall FindColor(
 
 // --- 内存读取功能 ---
 
+// NtWow64ReadVirtualMemory64 函数类型定义，用于32位进程读取64位进程内存
+typedef NTSTATUS (NTAPI *pfnNtWow64ReadVirtualMemory64)(
+    HANDLE ProcessHandle,
+    ULONGLONG BaseAddress,
+    PVOID Buffer,
+    ULONGLONG Size,
+    PULONGLONG NumberOfBytesRead
+);
+
+// NtWow64QueryInformationProcess64 函数类型定义，用于查询64位进程信息
+typedef NTSTATUS (NTAPI *pfnNtWow64QueryInformationProcess64)(
+    HANDLE ProcessHandle,
+    ULONG ProcessInformationClass,
+    PVOID ProcessInformation,
+    ULONG ProcessInformationLength,
+    PULONG ReturnLength
+);
+
+// 64位进程的PEB结构（简化版，只包含需要的字段）
+typedef struct _PEB64 {
+    BYTE Reserved1[2];
+    BYTE BeingDebugged;
+    BYTE Reserved2[21];
+    ULONGLONG Ldr;  // 偏移 0x18: PEB_LDR_DATA64 指针
+    // ... 其他字段省略
+} PEB64;
+
+// 64位进程的 PROCESS_BASIC_INFORMATION
+typedef struct _PROCESS_BASIC_INFORMATION64 {
+    ULONGLONG Reserved1;
+    ULONGLONG PebBaseAddress;
+    ULONGLONG Reserved2[2];
+    ULONGLONG UniqueProcessId;
+    ULONGLONG Reserved3;
+} PROCESS_BASIC_INFORMATION64;
+
+// 64位 PEB_LDR_DATA 结构
+typedef struct _PEB_LDR_DATA64 {
+    ULONG Length;
+    ULONG Initialized;
+    ULONGLONG SsHandle;
+    LIST_ENTRY64 InLoadOrderModuleList;
+    LIST_ENTRY64 InMemoryOrderModuleList;
+    LIST_ENTRY64 InInitializationOrderModuleList;
+} PEB_LDR_DATA64;
+
+// 64位 LDR_DATA_TABLE_ENTRY 结构
+typedef struct _LDR_DATA_TABLE_ENTRY64 {
+    LIST_ENTRY64 InLoadOrderLinks;
+    LIST_ENTRY64 InMemoryOrderLinks;
+    LIST_ENTRY64 InInitializationOrderLinks;
+    ULONGLONG DllBase;
+    ULONGLONG EntryPoint;
+    ULONG SizeOfImage;
+    ULONG Reserved;
+    UNICODE_STRING64 FullDllName;
+    UNICODE_STRING64 BaseDllName;
+} LDR_DATA_TABLE_ENTRY64;
+
+// 定义 UNICODE_STRING64（如果未定义）
+#ifndef _UNICODE_STRING64_DEFINED
+#define _UNICODE_STRING64_DEFINED
+typedef struct _UNICODE_STRING64 {
+    USHORT Length;
+    USHORT MaximumLength;
+    ULONGLONG Buffer;
+} UNICODE_STRING64;
+#endif
+
+// 定义 LIST_ENTRY64（如果未定义）
+#ifndef _LIST_ENTRY64_DEFINED
+#define _LIST_ENTRY64_DEFINED
+typedef struct _LIST_ENTRY64 {
+    ULONGLONG Flink;
+    ULONGLONG Blink;
+} LIST_ENTRY64;
+#endif
+
+// 全局函数指针，延迟加载
+static pfnNtWow64ReadVirtualMemory64 g_NtWow64ReadVirtualMemory64 = nullptr;
+static pfnNtWow64QueryInformationProcess64 g_NtWow64QueryInformationProcess64 = nullptr;
+static bool g_Wow64ApiInitialized = false;
+
+// 初始化 Wow64 API
+static bool InitWow64Api() {
+    if (g_Wow64ApiInitialized) {
+        return g_NtWow64ReadVirtualMemory64 != nullptr;
+    }
+    g_Wow64ApiInitialized = true;
+    
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (hNtdll) {
+        g_NtWow64ReadVirtualMemory64 = (pfnNtWow64ReadVirtualMemory64)
+            GetProcAddress(hNtdll, "NtWow64ReadVirtualMemory64");
+        g_NtWow64QueryInformationProcess64 = (pfnNtWow64QueryInformationProcess64)
+            GetProcAddress(hNtdll, "NtWow64QueryInformationProcess64");
+    }
+    return g_NtWow64ReadVirtualMemory64 != nullptr;
+}
+
+// 跨位数读取内存的封装函数
+static bool CrossReadProcessMemory(
+    HANDLE hProcess,
+    ULONGLONG address,
+    PVOID buffer,
+    SIZE_T size,
+    bool is64BitTarget
+) {
+    SIZE_T bytesRead = 0;
+    
+    if (is64BitTarget) {
+        // 64位目标进程，使用 NtWow64ReadVirtualMemory64
+        if (!g_NtWow64ReadVirtualMemory64) {
+            return false;
+        }
+        ULONGLONG bytesRead64 = 0;
+        NTSTATUS status = g_NtWow64ReadVirtualMemory64(
+            hProcess, address, buffer, size, &bytesRead64);
+        return (status >= 0) && (bytesRead64 == size);
+    } else {
+        // 32位目标进程，使用标准 ReadProcessMemory
+        return ReadProcessMemory(hProcess, (LPCVOID)(DWORD)address, buffer, size, &bytesRead) 
+               && (bytesRead == size);
+    }
+}
+
+/**
+ * @brief 获取64位进程中特定模块的基地址（通过读取PEB64）
+ */
+static ULONGLONG GetModuleBaseAddress64Bit(HANDLE hProcess, const char* moduleName) {
+    if (!g_NtWow64QueryInformationProcess64 || !g_NtWow64ReadVirtualMemory64) {
+        return 0;
+    }
+    
+    // 1. 获取64位进程的PEB地址
+    PROCESS_BASIC_INFORMATION64 pbi64 = {0};
+    ULONG returnLength = 0;
+    NTSTATUS status = g_NtWow64QueryInformationProcess64(
+        hProcess, 
+        0, // ProcessBasicInformation
+        &pbi64, 
+        sizeof(pbi64), 
+        &returnLength
+    );
+    
+    if (status < 0 || pbi64.PebBaseAddress == 0) {
+        return 0;
+    }
+    
+    // 2. 读取PEB64获取Ldr指针
+    ULONGLONG ldrAddress = 0;
+    ULONGLONG bytesRead = 0;
+    
+    // PEB64.Ldr 在偏移 0x18 处
+    status = g_NtWow64ReadVirtualMemory64(
+        hProcess,
+        pbi64.PebBaseAddress + 0x18,
+        &ldrAddress,
+        sizeof(ldrAddress),
+        &bytesRead
+    );
+    
+    if (status < 0 || ldrAddress == 0) {
+        return 0;
+    }
+    
+    // 3. 读取 PEB_LDR_DATA64 获取模块链表头
+    PEB_LDR_DATA64 ldrData = {0};
+    status = g_NtWow64ReadVirtualMemory64(
+        hProcess,
+        ldrAddress,
+        &ldrData,
+        sizeof(ldrData),
+        &bytesRead
+    );
+    
+    if (status < 0) {
+        return 0;
+    }
+    
+    // 4. 遍历 InLoadOrderModuleList 链表
+    ULONGLONG listHead = ldrAddress + offsetof(PEB_LDR_DATA64, InLoadOrderModuleList);
+    ULONGLONG currentEntry = ldrData.InLoadOrderModuleList.Flink;
+    
+    // 转换模块名为宽字符以便比较
+    wchar_t wModuleName[256] = {0};
+    MultiByteToWideChar(CP_ACP, 0, moduleName, -1, wModuleName, 256);
+    _wcslwr_s(wModuleName, 256); // 转小写
+    
+    int maxIterations = 1000; // 防止无限循环
+    while (currentEntry != listHead && maxIterations-- > 0) {
+        // 读取 LDR_DATA_TABLE_ENTRY64
+        LDR_DATA_TABLE_ENTRY64 entry = {0};
+        status = g_NtWow64ReadVirtualMemory64(
+            hProcess,
+            currentEntry,
+            &entry,
+            sizeof(entry),
+            &bytesRead
+        );
+        
+        if (status < 0) {
+            break;
+        }
+        
+        // 读取模块名
+        if (entry.BaseDllName.Length > 0 && entry.BaseDllName.Buffer != 0) {
+            wchar_t dllName[256] = {0};
+            USHORT nameLen = min(entry.BaseDllName.Length, (USHORT)(sizeof(dllName) - 2));
+            
+            status = g_NtWow64ReadVirtualMemory64(
+                hProcess,
+                entry.BaseDllName.Buffer,
+                dllName,
+                nameLen,
+                &bytesRead
+            );
+            
+            if (status >= 0) {
+                dllName[nameLen / sizeof(wchar_t)] = L'\0';
+                _wcslwr_s(dllName, 256); // 转小写
+                
+                // 比较模块名
+                if (wcscmp(dllName, wModuleName) == 0) {
+                    return entry.DllBase;
+                }
+            }
+        }
+        
+        // 移动到下一个条目
+        currentEntry = entry.InLoadOrderLinks.Flink;
+    }
+    
+    return 0;
+}
+
+/**
+ * @brief 获取指定进程中特定模块的基地址（支持32位和64位进程）
+ * 
+ * @param hProcess 已打开的进程句柄
+ * @param processId 目标进程的ID
+ * @param moduleName 要查找的模块名称
+ * @param is64BitProcess 目标进程是否为64位
+ * @return ULONGLONG 模块基地址，失败返回0
+ */
+static ULONGLONG GetModuleBaseAddressEx(HANDLE hProcess, DWORD processId, const char* moduleName, bool is64BitProcess) {
+    if (is64BitProcess) {
+        // 64位进程：通过PEB64获取模块基址
+        return GetModuleBaseAddress64Bit(hProcess, moduleName);
+    } else {
+        // 32位进程：使用标准的 CreateToolhelp32Snapshot
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
+        if (hSnap == INVALID_HANDLE_VALUE) {
+            return 0;
+        }
+        
+        MODULEENTRY32 me32;
+        me32.dwSize = sizeof(MODULEENTRY32);
+        
+        ULONGLONG result = 0;
+        if (Module32First(hSnap, &me32)) {
+            do {
+                if (_stricmp(me32.szModule, moduleName) == 0) {
+                    result = (ULONGLONG)(uintptr_t)me32.modBaseAddr;
+                    break;
+                }
+            } while (Module32Next(hSnap, &me32));
+        }
+        
+        CloseHandle(hSnap);
+        return result;
+    }
+}
+
 /**
  * @brief 获取指定进程中特定模块的基地址。
  * 
@@ -944,7 +1228,18 @@ const char* __stdcall ReadMemory(
         return resultBuffer; // 返回错误。
     }
 
-    // --- 3. 解析地址表达式 ---
+    // --- 3. 检测目标进程位数并初始化Wow64 API ---
+    BOOL isWow64Target = FALSE;
+    IsWow64Process(hProcess, &isWow64Target);
+    bool is64BitTarget = !isWow64Target; // isWow64=FALSE 表示是原生64位进程
+    
+    // 如果目标是64位进程，初始化Wow64 API
+    if (is64BitTarget && !InitWow64Api()) {
+        CloseHandle(hProcess);
+        return resultBuffer; // 无法初始化64位读取API
+    }
+
+    // --- 4. 解析地址表达式 ---
     char expr_copy[512]; // 创建一个可修改的副本，因为 strtok_s 会修改原字符串。
     strcpy_s(expr_copy, sizeof(expr_copy), addressExpression);
 
@@ -953,50 +1248,46 @@ const char* __stdcall ReadMemory(
     char* token = strtok_s(expr_copy, "[]+", &context);
     if (token == NULL) { CloseHandle(hProcess); return resultBuffer; } // 第一个 token 应该是模块名，如果为空则表达式无效。
 
-    // --- 3.1. 获取模块基地址 ---
-    uintptr_t finalAddress = 0; // 用于存储最终要读取的内存地址。
-    uintptr_t moduleBase = GetModuleBaseAddress(processId, token); // 调用辅助函数获取模块的基地址。
+    // --- 4.1. 获取模块基地址 ---
+    ULONGLONG finalAddress = 0; // 使用64位地址存储，兼容32/64位进程
+    ULONGLONG moduleBase = GetModuleBaseAddressEx(hProcess, processId, token, is64BitTarget);
     if (moduleBase == 0) { CloseHandle(hProcess); return resultBuffer; } // 如果找不到模块，则无法继续。
 
-    // --- 3.2. 计算初始地址 (基地址 + 第一个偏移) ---
+    // --- 4.2. 计算初始地址 (基地址 + 第一个偏移) ---
     token = strtok_s(NULL, "[]+", &context); // 获取下一个 token，即第一个偏移量。
     if (token == NULL) { CloseHandle(hProcess); return resultBuffer; } // 表达式必须至少有一个偏移量。
     finalAddress = moduleBase + std::stoull(token, nullptr, 16); // 将16进制的偏移字符串转换为数字，并与基地址相加。
 
-    // --- 3.3. 循环处理多级指针偏移 ---
-    BOOL isWow64 = FALSE; // 用于标记目标进程是否为在64位Windows上运行的32位进程。
-    IsWow64Process(hProcess, &isWow64); // 检测进程位数。
-
+    // --- 4.3. 循环处理多级指针偏移 ---
     // 循环获取后续的所有偏移量，直到没有更多 token。
     while ((token = strtok_s(NULL, "[]+", &context)) != NULL) {
-        uintptr_t temp_ptr = 0; // 临时变量，用于存储从内存中读取到的指针地址。
-        SIZE_T bytesRead = 0; // 存储实际读取到的字节数。
+        ULONGLONG temp_ptr = 0; // 临时变量，用于存储从内存中读取到的指针地址。
         
-        // 根据目标进程的位数（指针大小）来读取内存。
-        if (isWow64) { // 如果是64位进程，指针大小为8字节。
-            ULONGLONG ptr64 = 0; // 使用64位无符号长整型来存储指针。
-            // 从 finalAddress 读取一个指针。
-            if (!ReadProcessMemory(hProcess, (LPCVOID)finalAddress, &ptr64, sizeof(ptr64), &bytesRead) || bytesRead != sizeof(ptr64)) {
-                CloseHandle(hProcess); return resultBuffer; // 如果读取失败或读取的字节数不正确，则返回错误。
+        if (is64BitTarget) {
+            // 64位目标进程，读取8字节指针
+            ULONGLONG ptr64 = 0;
+            if (!CrossReadProcessMemory(hProcess, finalAddress, &ptr64, sizeof(ptr64), true)) {
+                CloseHandle(hProcess); return resultBuffer;
             }
-            temp_ptr = (uintptr_t)ptr64; // 将读取到的值存入临时变量。
-        } else { // 如果是32位进程，指针大小为4字节。
-            DWORD ptr32 = 0; // 使用32位无符号整数来存储指针。
-            if (!ReadProcessMemory(hProcess, (LPCVOID)finalAddress, &ptr32, sizeof(ptr32), &bytesRead) || bytesRead != sizeof(ptr32)) {
-                CloseHandle(hProcess); return resultBuffer; // 读取失败则返回错误。
+            temp_ptr = ptr64;
+        } else {
+            // 32位目标进程，读取4字节指针
+            DWORD ptr32 = 0;
+            if (!CrossReadProcessMemory(hProcess, finalAddress, &ptr32, sizeof(ptr32), false)) {
+                CloseHandle(hProcess); return resultBuffer;
             }
-            temp_ptr = (uintptr_t)ptr32; // 将读取到的值存入临时变量。
+            temp_ptr = ptr32;
         }
+        
         // 计算下一级地址：finalAddress = (上一步读到的指针值) + (当前偏移量)。
         finalAddress = temp_ptr + std::stoull(token, nullptr, 16);
     }
 
-    // --- 4. 读取最终地址的数据并格式化 ---
+    // --- 5. 读取最终地址的数据并格式化 ---
     char readBuffer[512] = { 0 }; // 定义一个缓冲区来存储从内存中读取的原始数据。
-    SIZE_T bytesReadFinal = 0; // 存储最终读取操作实际读取的字节数。
     // 从计算出的 finalAddress 读取指定大小的数据。
-    if (!ReadProcessMemory(hProcess, (LPCVOID)finalAddress, readBuffer, readSize, &bytesReadFinal) || bytesReadFinal == 0) {
-        CloseHandle(hProcess); // 如果读取失败或没有读到任何数据。
+    if (!CrossReadProcessMemory(hProcess, finalAddress, readBuffer, readSize, is64BitTarget)) {
+        CloseHandle(hProcess); // 如果读取失败。
         return resultBuffer; // 返回错误。
     }
 
@@ -1026,7 +1317,7 @@ const char* __stdcall ReadMemory(
         return resultBuffer;
     }
 
-    // --- 5. 清理并返回 ---
+    // --- 6. 清理并返回 ---
     CloseHandle(hProcess); // 关闭进程句柄，释放资源。
     return resultBuffer; // 返回格式化后的结果字符串。
 }
@@ -1130,104 +1421,56 @@ const char* __stdcall CaptureAndFindMultiTemplates(
     const char* multiTplPaths,
     double similarity
 ) {
-    // 定义一个足够大的静态缓冲区来存储返回结果，静态确保了指针在函数返回后依然有效。
-    static char resultBuffer[4096];
-    const char* errorResult = "-1"; // 定义表示错误的字符串。
-    const char* notFoundResult = ""; // 定义表示未找到的字符串（空字符串）。
+    // 使用 thread_local 确保线程安全
+    static thread_local char resultBuffer[4096];
+    const char* errorResult = "-1";
+    const char* notFoundResult = "";
 
     // --- 1. 参数校验 ---
-    // 检查窗口句柄、模板路径字符串和ROI尺寸的有效性。
     if (!IsWindow(hwnd) || !multiTplPaths || strlen(multiTplPaths) == 0 || roiWidth <= 0 || roiHeight <= 0) {
-        strcpy_s(resultBuffer, sizeof(resultBuffer), errorResult); // 参数无效，设置错误结果。
-        return resultBuffer; // 返回错误。
-    }
-
-    // --- 2. 截图 (这部分逻辑与 CaptureAndFindImage 完全相同) ---
-    HDC hdcWindow = GetDC(hwnd);
-    if (!hdcWindow) { strcpy_s(resultBuffer, sizeof(resultBuffer), errorResult); return resultBuffer; }
-
-    HDC hdcMem = CreateCompatibleDC(hdcWindow);
-    if (!hdcMem) { ReleaseDC(hwnd, hdcWindow); strcpy_s(resultBuffer, sizeof(resultBuffer), errorResult); return resultBuffer; }
-
-    HBITMAP hBitmap = CreateCompatibleBitmap(hdcWindow, roiWidth, roiHeight);
-    if (!hBitmap) { DeleteDC(hdcMem); ReleaseDC(hwnd, hdcWindow); strcpy_s(resultBuffer, sizeof(resultBuffer), errorResult); return resultBuffer; }
-
-    SelectObject(hdcMem, hBitmap);
-
-    if (!BitBlt(hdcMem, 0, 0, roiWidth, roiHeight, hdcWindow, roiX, roiY, SRCCOPY)) {
-        DeleteObject(hBitmap); DeleteDC(hdcMem); ReleaseDC(hwnd, hdcWindow); strcpy_s(resultBuffer, sizeof(resultBuffer), errorResult); return resultBuffer;
-    }
-
-    // --- 3. GDI 位图转像素缓冲区 (与 CaptureAndFindImage 相同) ---
-    BITMAPINFOHEADER bi;
-    bi.biSize = sizeof(BITMAPINFOHEADER);
-    bi.biWidth = roiWidth; bi.biHeight = -roiHeight; bi.biPlanes = 1;
-    bi.biBitCount = 32; bi.biCompression = BI_RGB;
-    bi.biSizeImage = 0; bi.biXPelsPerMeter = 0; bi.biYPelsPerMeter = 0; bi.biClrUsed = 0; bi.biClrImportant = 0;
-
-    int bmpBufferSize = roiWidth * roiHeight * 4;
-    unsigned char* bmpBuffer = new (std::nothrow) unsigned char[bmpBufferSize];
-    if (!bmpBuffer) {
-        DeleteObject(hBitmap); DeleteDC(hdcMem); ReleaseDC(hwnd, hdcWindow); strcpy_s(resultBuffer, sizeof(resultBuffer), errorResult); return resultBuffer;
-    }
-
-    GetDIBits(hdcMem, hBitmap, 0, (UINT)roiHeight, bmpBuffer, (BITMAPINFO*)&bi, DIB_RGB_COLORS);
-
-    // 释放GDI资源。
-    DeleteObject(hBitmap);
-    DeleteDC(hdcMem);
-    ReleaseDC(hwnd, hdcWindow);
-
-    // --- 4. 准备主图 (OpenCV Mat) ---
-    cv::Mat screenMat; // 用于存储转换后的截图。
-    try {
-        cv::Mat bgraMat(roiHeight, roiWidth, CV_8UC4, (void*)bmpBuffer); // 将像素缓冲区包装成Mat。
-        cv::cvtColor(bgraMat, screenMat, cv::COLOR_BGRA2BGR); // 将4通道BGRA转换为3通道BGR以进行模板匹配。
-    } catch (...) {
-        delete[] bmpBuffer; // 发生异常时释放内存。
-        strcpy_s(resultBuffer, sizeof(resultBuffer), errorResult);
-        return resultBuffer;
-    }
-    delete[] bmpBuffer; // 转换完成后立即释放像素缓冲区。
-
-    if (screenMat.empty()) { // 检查转换是否成功。
         strcpy_s(resultBuffer, sizeof(resultBuffer), errorResult);
         return resultBuffer;
     }
 
-    // --- 5. 解析模板路径并循环查找 ---
-    std::string allPaths(multiTplPaths); // 将C风格字符串转为std::string。
-    std::stringstream pathStream(allPaths); // 使用stringstream来按分隔符解析。
-    std::string singlePath; // 用于存储单个模板的路径。
-    std::stringstream finalResultStream; // 用于高效拼接最终的结果字符串。
-    bool firstMatch = true; // 标记是否是第一个找到的匹配项，用于控制分隔符'|'的添加。
+    // --- 2. 截图 (使用 Common 工具，避免代码重复和内存泄漏) ---
+    cv::Mat screenMat;
+    if (!Common::CaptureWindowRegion(hwnd, roiX, roiY, roiWidth, roiHeight, screenMat)) {
+        strcpy_s(resultBuffer, sizeof(resultBuffer), errorResult);
+        return resultBuffer;
+    }
 
-    while (std::getline(pathStream, singlePath, '|')) { // 按'|'分割字符串，遍历每个模板路径。
-        if (singlePath.empty()) continue; // 如果路径为空则跳过。
+    // --- 3. 解析模板路径并循环查找 ---
+    std::string allPaths(multiTplPaths);
+    std::stringstream pathStream(allPaths);
+    std::string singlePath;
+    std::stringstream finalResultStream;
+    bool firstMatch = true;
+
+    while (std::getline(pathStream, singlePath, '|')) {
+        if (singlePath.empty()) continue;
 
         try {
-            cv::Mat tpl = cv::imread(singlePath, cv::IMREAD_COLOR); // 加载当前模板图片。
-            if (tpl.empty()) continue; // 如果加载失败，则跳过此模板，继续下一个。
+            cv::Mat tpl = cv::imread(singlePath, cv::IMREAD_COLOR);
+            if (tpl.empty()) continue;
 
-            // 从完整路径中提取文件名，用于在结果中标识是哪个模板匹配成功。
+            // 从完整路径中提取文件名
             std::string filename = singlePath.substr(singlePath.find_last_of("/\\") + 1);
 
-            cv::Mat matchResult; // 用于存储模板匹配的结果矩阵。
-            cv::matchTemplate(screenMat, tpl, matchResult, cv::TM_CCOEFF_NORMED); // 执行模板匹配。
+            cv::Mat matchResult;
+            cv::matchTemplate(screenMat, tpl, matchResult, cv::TM_CCOEFF_NORMED);
 
             double minVal, maxVal;
             cv::Point minLoc, maxLoc;
 
-            // 循环查找当前模板的所有匹配项，直到找不到满足条件的匹配。
+            // 循环查找当前模板的所有匹配项
             while (true) {
-                cv::minMaxLoc(matchResult, &minVal, &maxVal, &minLoc, &maxLoc); // 在结果矩阵中查找最大值（最佳匹配点）。
-                if (maxVal >= similarity) { // 检查最佳匹配点的相似度是否满足阈值。
-                    if (!firstMatch) { // 如果不是第一个匹配项。
-                        finalResultStream << "|"; // 在前面添加分隔符。
+                cv::minMaxLoc(matchResult, &minVal, &maxVal, &minLoc, &maxLoc);
+                if (maxVal >= similarity) {
+                    if (!firstMatch) {
+                        finalResultStream << "|";
                     }
-                    // 拼接结果字符串，格式为: "文件名,窗口X坐标,窗口Y坐标,相似度"。
                     finalResultStream << filename << "," << (roiX + maxLoc.x) << "," << (roiY + maxLoc.y) << "," << maxVal;
-                    firstMatch = false; // 更新标记。
+                    firstMatch = false;
                     
                     // 关键步骤：在结果矩阵中将刚刚找到的区域“涂黑”（填充一个低值，这里是0），
                     // 这样在下一次循环中 minMaxLoc 就不会再次找到这个相同或重叠的位置。

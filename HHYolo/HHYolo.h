@@ -151,6 +151,10 @@ HHAPI const char* __stdcall FindColor(
  * @brief 通过定位“锚点”图片，并基于固定的网格布局参数，批量分析网格中各个单元格的状态。
  * @details 这是一个为固定UI布局设计的、高性能的批量分析API。它首先在窗口截图中寻找锚点，然后根据传入的几何参数推算出每个格子的位置，并分析每个格子内部的状态（例如血条）。
  * @param hwnd 目标窗口句柄。
+ * @param roiX 截图区域左上角的X坐标 (相对于窗口客户区)。
+ * @param roiY 截图区域左上角的Y坐标 (相对于窗口客户区)。
+ * @param roiWidth 截图区域的宽度。
+ * @param roiHeight 截图区域的高度。
  * @param anchorTplPath 用于定位整个框架的锚点模板图片路径。
  * @param similarity 查找锚点的相似度阈值 (0.0 ~ 1.0)。
  * @param gridRows 网格的行数。
@@ -171,6 +175,10 @@ HHAPI const char* __stdcall FindColor(
  */
 HHAPI const char* __stdcall AnalyzeGrid(
     HWND hwnd,
+    int roiX,
+    int roiY,
+    int roiWidth,
+    int roiHeight,
     const char* anchorTplPath,
     double similarity,
     int gridRows,
